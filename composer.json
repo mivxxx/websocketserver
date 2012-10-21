@@ -1,0 +1,17 @@
+{
+    "name": "iris/websocket-server"
+  , "type": "library"
+  , "homepage": "http://iriscrm.ru"
+  , "keywords": ["WebSocket", "Iris"]
+  , "license": "MIT"
+  , "minimum-stability": "dev"
+ , "autoload": {
+        "psr-0": {
+            "Iris\\WebSocket": "src"
+        }
+    }
+  , "require": {
+        "php": ">=5.3.3"
+      , "cboden/Ratchet": "dev-master"
+    }
+}
