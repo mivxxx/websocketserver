@@ -8,6 +8,7 @@ class WebSocketServer implements MessageComponentInterface {
 
     protected $clients;         // WS connections
 	protected $oktell = null;   // oktell connection (stored twice for more fast searching)
+	protected pbxNumbers = array();
 
 
 	///////////////////////////////////
@@ -24,19 +25,65 @@ class WebSocketServer implements MessageComponentInterface {
         $this->clients->attach($conn);
 		
 		// send whoareyou message to client
-		$this->sendWhoAreYou($conn);
+		$this->onOpenHandler($conn);
     }
 
     public function onMessage(ConnectionInterface $from, $msg) {
 		echo 'read> '.$msg.chr(10);
 		//$server->log('read> '.$msg);
 		$messageData = json_decode($msg, true);
-		
+
 		// if multipart message is recieved, then collect them
 		if ($messageData[0] == 'multipart') {
+			// TODO
 		}
-		
+
 		switch ($messageData[0]) {
+			// client messages
+			case 'login':
+			case 'logout':
+			case 'entercallcenter':
+			case 'exitcallcenter':
+			case 'getuserstate':
+			case 'setuserstate':
+			case 'getuserstate':
+
+			case 'pbxautocallstart':
+			case 'pbxautocallabort':
+			case 'pbxtransfercall':
+			case 'getpbxnumbers':
+			case 'pbxabortcall':
+			case 'sendusertextmessage':
+				$this->transferToOktell($messageData, true);
+			break;
+
+			// oktell messages
+			case 'loginresult':
+			case 'logoutresult':
+			case 'userstatechanged':
+			case 'getuserstateresult':
+			case 'closeform':
+			case 'shownotifymessage':
+
+			case 'pbxautocallstartresult':
+			case 'pbxtransfercallresult':
+
+			// ring events (only transfer to client)
+			case 'phoneevent_ringstarted':
+			case 'phoneevent_ringstopped':
+			case 'phoneevent_commstarted':
+			case 'phoneevent_commstopped':
+			case 'phoneevent_ivrstarted':
+			case 'phoneevent_ivrstopped':
+			case 'phoneevent_acmcallstarted':
+			case 'phoneevent_acmcallstopped':
+			case 'phoneevent_faxstarted':
+			case 'phoneevent_faxstopped':
+			case 'phoneevent_faxreceived':
+			case 'usertextmessagereceived':
+				$this->transferToClient($messageData);
+			break;
+
 			case 'whoareyou':
 				$this->whoareyouHandler($from, $messageData);
 				
@@ -44,6 +91,35 @@ class WebSocketServer implements MessageComponentInterface {
 				$this->iamHandler($from, $messageData);
 			break;
 
+			case 'getpbxnumbersresult':
+				$this->savePbxNumbers($messageData);
+			break;
+
+			case 'pbxnumberstatechanged':
+				$this->updatePbxNumbers($messageData);
+				$this->broadcastToClients($messageData);
+			break;
+
+			case 'getactiveusers':
+				$this->getactiveusersHandler($messageData);
+			break;
+
+			case 'iris_getpbxnumberslist':
+				$this->getpbxnumberslistHandler($from, $messageData);
+			break;
+
+			case 'ping':
+				$this->pingHandler($from, $messagedata);
+			break;
+
+			// Oktell API commands
+			case 'getavailableforms':
+			case 'getavailablemethods':
+			case 'showform':
+			case 'executemethod':
+				//$this->apiCommandsHandler($from, $messagedata);
+			break;
+			
 			default:
 				// TODO
 			}
@@ -88,23 +164,23 @@ class WebSocketServer implements MessageComponentInterface {
 	        return $uuid;
 	    }
 	}
-	
-	protected function whoareyouHandler(ConnectionInterface $conn) {
+
+	protected function onOpenHandler(ConnectionInterface $conn) {
 		$message = json_encode(
 			array(
 				'whoareyou', 
 				array(
-					"qid" => substr($this->getGUID(), 1, 36), 
-					"type" => 'ws-server', 
-					"name" => 'Iris CRM', 
-					"version" => $this->version 
+					"qid" => $this->getGUID(),
+					"type" => 'ws-server',
+					"name" => 'Iris CRM',
+					"version" => $this->version
 				)
 			)
 		);
 		$conn->send($message);
 	}
 
-	protected function sendIam(ConnectionInterface $conn, $messageData) {
+	protected function whoareyouHandler(ConnectionInterface $conn, $messageData) {
 		$message = json_encode(
 			array(
 				'iam', 
@@ -142,7 +218,121 @@ class WebSocketServer implements MessageComponentInterface {
 		// if oktell is connected
 		if ($messageData[1]['type'] == 'commserver') {
 			$this->oktell = $conn;
-			// TODO: request pbxnumbers
+			// request pbxnumbers
+			$this->requestPbxNumbers();
 		}
 	}
+
+	protected function requestPbxNumbers() {
+		if ($this->oktell == null) {
+			return;
+		}
+		$this->oktell->send(json_encode(array(
+			'getpbxnumbers', 
+			array(
+				"qid" => $this->getGUID(),
+				"userlogin" => '',
+				"userid" => '',
+				"mode" => "full"
+			)
+		)));
+	}
+
+	protected function savePbxNumbers($data) {
+		$numbers = $data[1]['numbers'];
+		foreach ($numbers as $number) {
+			$this->pbxNumbers[$number['number']] = $number;
+		}
+		ksort($this->pbxNumbers);
+	}
+
+	protected function updatePbxNumbers($numbers) {
+		foreach ($numbers as $number) {
+			if ($this->pbxNumbers[$numbers['num']] == null)
+				continue;
+				
+			$this->pbxNumbers[$number['num']]['state'] = $number['num']['numstateid'];
+		}
+	}
+
+	protected function transferToOktell($data, $isEncode) {
+		$message = $isEncode ? json_encode($data) : $data;
+		if ($this->oktell) {
+			$this->oktell->send($message);
+		}
+	}
+
+	protected function transferToClient($data) {
+        foreach ($this->clients as $client) {
+			if ($client->type != 'iriscrm-client') {
+				continue;
+			}
+            
+			if 	(($client->userid != null) and
+					(($client->userid == $data[1]['userid']) or 
+					($client->userlogin == $data[1]['userlogin']))) {
+				$client->send(json_encode($data));
+				break;
+			}
+        }
+	}
+
+	protected function broadcastToClients($messageData) {
+        foreach ($this->clients as $client) {
+			if ($client->type != 'iriscrm-client') {
+				continue;
+			}
+
+			$client->send(json_encode($messageData));
+			}
+        }
+	}
+
+	protected function getactiveusersHandler($messageData) {
+		$activeUsers = array();
+        foreach ($this->clients as $client) {
+			if ($client->type != 'iriscrm-client') {
+				continue;
+			}
+ 			$activeUsers[] = array(
+				"userlogin" => $client->userlogin,
+				"userid" => $client->userid,
+				"type" => $client->type
+			);
+		}
+		
+		if ($this->oktell == null) {
+			return;
+		}
+		$this->oktell->send(json_encode(array(
+			'activeusers',
+			array(
+				"qid" => $messageData[1]['qid'],
+				"users" => $activeUsers
+			)
+		)));
+	}
+
+	protected function getpbxnumberslistHandler($from, $messageData) {
+		if ($this->pbxNumbers == null) {
+			// TODO: request pbxNumbers from oktell
+			return;
+		}
+
+		$this->transferToClient(array(
+			"pbxnumberslist",
+			array(
+				"userid" => $messageData[1]["userid"],
+				"userlogin" => $messageData[1]["userlogin"],
+				"numbers" => $$this->pbxNumbers
+			)
+		));
+	}
+
+	protected function pingHandler($from, $messageData) {
+		$answer = $messageData;
+		$answer[0] = 'pong';
+		$from->send(json_encode($answer));
+	}
+
 }
