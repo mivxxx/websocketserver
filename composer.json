@@ -13,5 +13,6 @@
   , "require": {
         "php": ">=5.3.3"
       , "cboden/Ratchet": "dev-master"
+	  , "monolog/monolog": "dev-master"
     }
 }

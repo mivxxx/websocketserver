@@ -2,25 +2,41 @@
 namespace Iris\WebSocket;
 use Ratchet\MessageComponentInterface;
 use Ratchet\ConnectionInterface;
+use Monolog\Logger;
 
 class WebSocketServer implements MessageComponentInterface {
 	protected $version = '2.0'; // Websocket server version
 
+	protected $settings;        // settings array
+	protected $log;             // log class
     protected $clients;         // WS connections
 	protected $oktell = null;   // oktell connection (stored twice for more fast searching)
-	protected pbxNumbers = array();
+	protected $pbxNumbers = array();
+	protected $multipartBuffer = array();
+	
+	const TYPE_CLIENT = 'iriscrm-client';
+	const TYPE_OKTELL = 'commserver';
 
 
 	///////////////////////////////////
 	///////  public functions   ///////
 	///////////////////////////////////
 
-    public function __construct() {
+    public function __construct($settings, Logger $log = null) {
+		$this->settings = $settings;
+		$this->log = $log;
+
         $this->clients = new \SplObjectStorage;
+
+		$this->log->addInfo('------- websocket server started -------');
+		$this->log->addInfo('Version   : '.$this->version);
+		$this->log->addInfo('Listen on : '.$this->settings->listenPort);
+		$this->log->addInfo('----------------------------------------');
     }
 
     public function onOpen(ConnectionInterface $conn) {
-		echo '---connected'.chr(10);
+		$this->log->addInfo('new connection', $this->getConnectionInfo($conn));
+
         // Store the new connection to send messages to later
         $this->clients->attach($conn);
 		
@@ -29,14 +45,26 @@ class WebSocketServer implements MessageComponentInterface {
     }
 
     public function onMessage(ConnectionInterface $from, $msg) {
-		echo 'read> '.$msg.chr(10);
-		//$server->log('read> '.$msg);
 		$messageData = json_decode($msg, true);
+
+		$logData = $this->getConnectionInfo($from);
+		$logData['message'] = $messageData;
+		$this->log->addInfo('new message', $logData);		
 
 		// if multipart message is recieved, then collect them
 		if ($messageData[0] == 'multipart') {
-			// TODO
+			//$this->log->addError('multipart message is not implemented yet');
+			//return;
+			$messageData = $this->collectMultipartMessage($messageData);
+			if ($messageData == null) {
+				// if not all parts is recieved, then wait them
+				return;
+			} else {
+				$logData['message'] = $messageData;
+				$this->log->addInfo('new multipart message', $logData);		
+			}
 		}
+
 
 		switch ($messageData[0]) {
 			// client messages
@@ -109,7 +137,7 @@ class WebSocketServer implements MessageComponentInterface {
 			break;
 
 			case 'ping':
-				$this->pingHandler($from, $messagedata);
+				$this->pingHandler($from, $messageData);
 			break;
 
 			// Oktell API commands
@@ -117,7 +145,7 @@ class WebSocketServer implements MessageComponentInterface {
 			case 'getavailablemethods':
 			case 'showform':
 			case 'executemethod':
-				//$this->apiCommandsHandler($from, $messagedata);
+				//$this->apiCommandsHandler($from, $messageData);
 			break;
 			
 			default:
@@ -134,12 +162,20 @@ class WebSocketServer implements MessageComponentInterface {
     }
 
     public function onClose(ConnectionInterface $conn) {
+		$this->log->addInfo('connection closed', $this->getConnectionInfo($conn));
+		if ($conn->type == static::TYPE_OKTELL) {
+			$this->log->addError('commserver disconnected');
+		}
+
         // The connection is closed, remove it, as we can no longer send it messages
         $this->clients->detach($conn);
     }
 
     public function onError(ConnectionInterface $conn, \Exception $e) {
-        echo "An error has occurred: {$e->getMessage()}\n";
+        //echo "An error has occurred: {$e->getMessage()}\n";
+		$logData = $this->getConnectionInfo($conn);
+		$logData['errm'] = $e->getMessage();
+		$this->log->addError('error occured, connection now closing', $logData);
 
         $conn->close();
     }
@@ -147,6 +183,65 @@ class WebSocketServer implements MessageComponentInterface {
 	///////////////////////////////////
 	/////// protected functions ///////
 	///////////////////////////////////
+
+	protected function getConnectionInfo($conn) {
+		$connectionInfo = array(
+			'resource' => $conn->resourceId,
+			'address' => $conn->remoteAddress
+		);
+		
+		if (isset($conn->type)) {
+			$connectionInfo['type'] = $conn->type;
+		} else {
+			return $connectionInfo;
+		}
+		if (isset($conn->userlogin)) {
+			$connectionInfo['userlogin'] = $conn->userlogin;
+		}
+		return $connectionInfo;
+	}
+	
+	// multipart messages collect function
+	protected function collectMultipartMessage($messageData) {
+		$messageId = $messageData[1]['message-id'];
+		$packetNumber = $messageData[1]['packetnumber'];
+		$packetCount = $messageData[1]['packetcount'];
+
+		// first packet
+		if ($this->multipartBuffer[$messageId] == null) {
+			$this->multipartBuffer[$messageId]['packetcount'] = $packetCount;
+			$this->multipartBuffer[$messageId]['packetrecieved'] = 0;
+		}
+
+		$dataPart = null;
+		switch ($messageData[1]['content-transfer-encoding']) {
+			case 'base64':
+				$dataPart = base64_decode($messageData[1]['content']);
+			break;
+		}
+
+		$this->multipartBuffer[$messageId]['datapart'][$packetNumber] = $dataPart;
+		$this->multipartBuffer[$messageId]['packetrecieved']++;
+
+		// if last packet is recieved then clean buffer and return full message
+		if ($this->multipartBuffer[$messageId]['packetrecieved'] == $packetCount) {
+			ksort($this->multipartBuffer[$messageId]['datapart']);
+			$data = implode('', $this->multipartBuffer[$messageId]['datapart']);
+
+			unset($this->multipartBuffer[$messageId]);
+			return json_decode($data, true);
+		}
+
+		return null;
+	}
+	
+	protected function sendMessage($conn, $message) {
+		$logData = $this->getConnectionInfo($conn);
+		$logData['message'] = $message;
+		$this->log->addInfo('new message', $logData);
+
+		$conn->send($message);
+	}
 
 	// Get random GUID
 	protected function getGUID() {
@@ -177,7 +272,8 @@ class WebSocketServer implements MessageComponentInterface {
 				)
 			)
 		);
-		$conn->send($message);
+		//$conn->send($message);
+		$this->sendMessage($conn, $message);
 	}
 
 	protected function whoareyouHandler(ConnectionInterface $conn, $messageData) {
@@ -200,7 +296,7 @@ class WebSocketServer implements MessageComponentInterface {
 		$conn->type = $messageData[1]['type'];
 
 		// if client is connected
-		if ($messageData[1]['type'] == 'iriscrm-client') {
+		if ($messageData[1]['type'] == static::TYPE_CLIENT) {
 			// store client info
 			$conn->userid = $messageData[1]['userid'];
 			$conn->userlogin = $messageData[1]['userlogin'];
@@ -216,7 +312,7 @@ class WebSocketServer implements MessageComponentInterface {
 		}
 		
 		// if oktell is connected
-		if ($messageData[1]['type'] == 'commserver') {
+		if ($messageData[1]['type'] == static::TYPE_OKTELL) {
 			$this->oktell = $conn;
 			// request pbxnumbers
 			$this->requestPbxNumbers();
@@ -264,7 +360,7 @@ class WebSocketServer implements MessageComponentInterface {
 
 	protected function transferToClient($data) {
         foreach ($this->clients as $client) {
-			if ($client->type != 'iriscrm-client') {
+			if ($client->type != static::TYPE_CLIENT) {
 				continue;
 			}
             
@@ -279,19 +375,18 @@ class WebSocketServer implements MessageComponentInterface {
 
 	protected function broadcastToClients($messageData) {
         foreach ($this->clients as $client) {
-			if ($client->type != 'iriscrm-client') {
+			if ($client->type != static::TYPE_CLIENT) {
 				continue;
 			}
 
 			$client->send(json_encode($messageData));
-			}
         }
 	}
 
 	protected function getactiveusersHandler($messageData) {
 		$activeUsers = array();
         foreach ($this->clients as $client) {
-			if ($client->type != 'iriscrm-client') {
+			if ($client->type != static::TYPE_CLIENT) {
 				continue;
 			}
  			$activeUsers[] = array(

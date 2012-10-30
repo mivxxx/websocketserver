@@ -1,0 +1,7 @@
+{
+  "listenPort": 8045,
+  "commandURL": "http://localhost/iriscrm/config/command/exec.php",
+  "logToFile": true,
+  "logToStdout": true,
+  "logFileName": "server"
+}
