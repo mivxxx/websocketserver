@@ -16,6 +16,7 @@ class WebSocketServer implements MessageComponentInterface {
 	
 	const TYPE_CLIENT = 'iriscrm-client';
 	const TYPE_OKTELL = 'commserver';
+	const BUFFER_SIZE = 2048;
 
 
 	///////////////////////////////////
@@ -53,8 +54,6 @@ class WebSocketServer implements MessageComponentInterface {
 
 		// if multipart message is recieved, then collect them
 		if ($messageData[0] == 'multipart') {
-			//$this->log->addError('multipart message is not implemented yet');
-			//return;
 			$messageData = $this->collectMultipartMessage($messageData);
 			if ($messageData == null) {
 				// if not all parts is recieved, then wait them
@@ -74,7 +73,6 @@ class WebSocketServer implements MessageComponentInterface {
 			case 'exitcallcenter':
 			case 'getuserstate':
 			case 'setuserstate':
-			case 'getuserstate':
 
 			case 'pbxautocallstart':
 			case 'pbxautocallabort':
@@ -82,7 +80,7 @@ class WebSocketServer implements MessageComponentInterface {
 			case 'getpbxnumbers':
 			case 'pbxabortcall':
 			case 'sendusertextmessage':
-				$this->transferToOktell($messageData, true);
+				$this->transferToOktell($messageData);
 			break;
 
 			// oktell messages
@@ -145,20 +143,12 @@ class WebSocketServer implements MessageComponentInterface {
 			case 'getavailablemethods':
 			case 'showform':
 			case 'executemethod':
-				//$this->apiCommandsHandler($from, $messageData);
+				$this->apiCommandsHandler($from, $messageData);
 			break;
 			
 			default:
 				// TODO
 			}
-/*
-        foreach ($this->clients as $client) {
-            //if ($from !== $client) {
-                $client->send($msg);
-                //$client->send($from->name.':'.$msg);
-            //}
-        }
-*/
     }
 
     public function onClose(ConnectionInterface $conn) {
@@ -272,7 +262,6 @@ class WebSocketServer implements MessageComponentInterface {
 				)
 			)
 		);
-		//$conn->send($message);
 		$this->sendMessage($conn, $message);
 	}
 
@@ -342,17 +331,18 @@ class WebSocketServer implements MessageComponentInterface {
 		ksort($this->pbxNumbers);
 	}
 
-	protected function updatePbxNumbers($numbers) {
+	protected function updatePbxNumbers($data) {
+		$numbers = $data[1]['numbers'];
 		foreach ($numbers as $number) {
-			if ($this->pbxNumbers[$numbers['num']] == null)
+			if ($this->pbxNumbers[$number['num']] == null)
 				continue;
 				
 			$this->pbxNumbers[$number['num']]['state'] = $number['num']['numstateid'];
 		}
 	}
 
-	protected function transferToOktell($data, $isEncode) {
-		$message = $isEncode ? json_encode($data) : $data;
+	protected function transferToOktell($data) {
+		$message = json_encode($data);
 		if ($this->oktell) {
 			$this->oktell->send($message);
 		}
@@ -419,7 +409,7 @@ class WebSocketServer implements MessageComponentInterface {
 			array(
 				"userid" => $messageData[1]["userid"],
 				"userlogin" => $messageData[1]["userlogin"],
-				"numbers" => $$this->pbxNumbers
+				"numbers" => $this->pbxNumbers
 			)
 		));
 	}
@@ -428,6 +418,76 @@ class WebSocketServer implements MessageComponentInterface {
 		$answer = $messageData;
 		$answer[0] = 'pong';
 		$from->send(json_encode($answer));
+	}
+	
+	protected function apiCommandsHandler($from, $messageData) {
+		// send POST request to Iris and transfer response to Oktell or client (in case showuserform message)
+		$ch = curl_init($this->settings->commandURL);
+		curl_setopt($ch, CURLOPT_POST, 1);
+		curl_setopt($ch, CURLOPT_FOLLOWLOCATION, 1);
+		curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, 0); // do not verify that ssl cert is valid (it is not the case for failover server)
+		curl_setopt($ch, CURLOPT_USERAGENT, "Iris CRM ws server");
+		curl_setopt($ch, CURLOPT_TIMEOUT, 10); // 10 seconds
+		curl_setopt($ch, CURLOPT_POSTFIELDS, array("data" => base64_encode(json_encode($messageData)), "isbase64" => 1));
+
+		ob_start();
+		$bSuccess=curl_exec($ch);
+		$responseString=ob_get_contents();
+		ob_end_clean();
+		$http_result_code=curl_getinfo($ch, CURLINFO_HTTP_CODE);
+		curl_close($ch);
+
+		$this->log->addInfo('command execute result', array($responseString));
+		$responseData = json_decode($responseString, true);
+		if (is_array($responseData) == false) {
+			$this->log->addError('showform or executemethod returned with error', array($responseString));
+			return;
+		}
+
+		if ($responseData[0] == 'showuserform') {
+			// transfer showuserform command to client
+			$this->transferToClient($responseData);
+		} else {
+			// transfer availableforms, availablemethods or methodresult commands to Oktell
+			$messageParts = $this->splitLongMessageString($responseString);
+			foreach ($messageParts as $message) {
+				$this->log->addInfo('part', $message);
+				$this->transferToOktell($message);
+			}
+		}
+	}
+	
+	// split long message string to multipart messages
+	// messageString - in, string
+	// returns array arrays (messages)
+	protected function splitLongMessageString($messageString) {
+		if (strlen($messageString) <= static::BUFFER_SIZE) {
+			return array(
+				json_decode($messageString, true)
+			);
+		}
+
+		$result = array();
+		$message_id = $this->getGUID();
+		$encoded = chunk_split(base64_encode($messageString), static::BUFFER_SIZE, chr(10));
+		$encoded = explode(chr(10), $encoded);
+		$packetcount = count($encoded) - 1;
+		for ($i = 0; $i < $packetcount; $i++) {
+			$result[] = array(
+				"multipart",
+				array (
+					"message-id" => $message_id,
+					"packetcount" => $packetcount,
+					"packetnumber" => ($i+0),
+					"content-type" => "text/json; charset=utf-8",
+					"content-transfer-encoding" => "base64",
+					"content-length" => strlen($encoded[$i]),
+					"content" => $encoded[$i]
+				)
+			);
+		}
+
+		return $result;
 	}
 
 }
