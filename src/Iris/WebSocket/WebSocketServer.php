@@ -10,7 +10,7 @@ class WebSocketServer implements MessageComponentInterface {
 	protected $settings;        // settings array
 	protected $log;             // log class
     protected $clients;         // WS connections
-	protected $oktell = null;   // oktell connection (stored twice for more fast searching)
+	//protected $oktell = null;   // oktell connection (stored twice for more fast searching)
 	protected $pbxNumbers = array();
 	protected $multipartBuffer = array();
 	
@@ -50,7 +50,7 @@ class WebSocketServer implements MessageComponentInterface {
 
 		$logData = $this->getConnectionInfo($from);
 		$logData['message'] = $messageData;
-		$this->log->addInfo('new message', $logData);		
+		$this->log->addInfo('message in', $logData);		
 
 		// if multipart message is recieved, then collect them
 		if ($messageData[0] == 'multipart') {
@@ -153,7 +153,7 @@ class WebSocketServer implements MessageComponentInterface {
 
     public function onClose(ConnectionInterface $conn) {
 		$this->log->addInfo('connection closed', $this->getConnectionInfo($conn));
-		if ($conn->type == static::TYPE_OKTELL) {
+		if (isset($conn->type) and $conn->type == static::TYPE_OKTELL) {
 			$this->log->addError('commserver disconnected');
 		}
 
@@ -228,7 +228,7 @@ class WebSocketServer implements MessageComponentInterface {
 	protected function sendMessage($conn, $message) {
 		$logData = $this->getConnectionInfo($conn);
 		$logData['message'] = $message;
-		$this->log->addInfo('new message', $logData);
+		$this->log->addInfo('message out', $logData);
 
 		$conn->send($message);
 	}
@@ -285,7 +285,7 @@ class WebSocketServer implements MessageComponentInterface {
 		$conn->type = $messageData[1]['type'];
 
 		// if client is connected
-		if ($messageData[1]['type'] == static::TYPE_CLIENT) {
+		if ($conn->type == static::TYPE_CLIENT) {
 			// store client info
 			$conn->userid = $messageData[1]['userid'];
 			$conn->userlogin = $messageData[1]['userlogin'];
@@ -301,18 +301,15 @@ class WebSocketServer implements MessageComponentInterface {
 		}
 		
 		// if oktell is connected
-		if ($messageData[1]['type'] == static::TYPE_OKTELL) {
-			$this->oktell = $conn;
+		if ($conn->type == static::TYPE_OKTELL) {
+			//$this->oktell = $conn;
 			// request pbxnumbers
 			$this->requestPbxNumbers();
 		}
 	}
 
 	protected function requestPbxNumbers() {
-		if ($this->oktell == null) {
-			return;
-		}
-		$this->oktell->send(json_encode(array(
+		$this->transferToOktell(array(
 			'getpbxnumbers', 
 			array(
 				"qid" => $this->getGUID(),
@@ -320,7 +317,7 @@ class WebSocketServer implements MessageComponentInterface {
 				"userid" => '',
 				"mode" => "full"
 			)
-		)));
+		));
 	}
 
 	protected function savePbxNumbers($data) {
@@ -342,10 +339,26 @@ class WebSocketServer implements MessageComponentInterface {
 	}
 
 	protected function transferToOktell($data) {
+        $message = json_encode($data);
+		$find_flag = 0;
+		foreach ($this->clients as $client) {
+			if ($client->type != static::TYPE_OKTELL) {
+				continue;
+			}
+			$client->send($message);
+			$find_flag = 1;
+        }
+		if (!$find_flag) {
+			$this->log->addError('transferToOktell error: Oktell not found');
+		}
+/*
 		$message = json_encode($data);
 		if ($this->oktell) {
 			$this->oktell->send($message);
+		} else {
+			$this->log->addError('Oktell not found');
 		}
+*/
 	}
 
 	protected function transferToClient($data) {
@@ -386,16 +399,13 @@ class WebSocketServer implements MessageComponentInterface {
 			);
 		}
 		
-		if ($this->oktell == null) {
-			return;
-		}
-		$this->oktell->send(json_encode(array(
+		$this->transferToOktell(array(
 			'activeusers',
 			array(
 				"qid" => $messageData[1]['qid'],
 				"users" => $activeUsers
 			)
-		)));
+		));
 	}
 
 	protected function getpbxnumberslistHandler($from, $messageData) {
